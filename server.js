@@ -2,22 +2,18 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-
-// Se estiver em Node < 18, descomente e rode "npm i node-fetch"
-// const fetch = require('node-fetch');
+const { Pool } = require('pg'); // <-- Postgres
 
 const app = express();
 
-// Lidos apenas no backend (NUNCA enviados para o front)
+// --------- FONE NODE CONFIG (from .env in Render) ----------
 const FONE_BASE_URL = process.env.FONE_BASE_URL;
 const FONE_SDK_KEY  = process.env.FONE_SDK_KEY;
 
-// Apenas normaliza barra final
 function normBase(u) {
   return (u || '').replace(/\/+$/, '');
 }
 
-// Garantir que o backend está configurado
 function assertFoneConfigured() {
   if (!FONE_BASE_URL || !FONE_SDK_KEY) {
     throw new Error('Fone API not configured (FONE_BASE_URL / FONE_SDK_KEY missing)');
@@ -47,39 +43,124 @@ async function callFone(path, method = 'GET', body) {
   catch { data = { raw: txt }; }
 
   if (!res.ok) {
-    // Importante: não logar SDK nem URL aqui, só código/erro genérico
     const msg = data.error || res.statusText || `HTTP ${res.status}`;
     throw new Error(msg);
   }
   return data;
 }
 
-// ----- Middlewares -----
-app.use(cors());           // se quiser, pode restringir origin
+// --------- POSTGRES CONFIG ----------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_SSL === 'true'
+    ? { rejectUnauthorized: false }
+    : false
+});
+
+async function query(text, params) {
+  const res = await pool.query(text, params);
+  return res;
+}
+
+// Criação das tabelas básicas, se ainda não existirem
+async function initDb() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS wallets (
+      addr        TEXT PRIMARY KEY,
+      created_at  TIMESTAMP DEFAULT now()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS user_state (
+      addr        TEXT PRIMARY KEY REFERENCES wallets(addr) ON DELETE CASCADE,
+      credits     NUMERIC(32,8) DEFAULT 0,
+      reputation  INTEGER       DEFAULT 0,
+      updated_at  TIMESTAMP     DEFAULT now()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS mission_completion (
+      id          SERIAL PRIMARY KEY,
+      addr        TEXT REFERENCES wallets(addr) ON DELETE CASCADE,
+      mission_id  TEXT NOT NULL,
+      report      TEXT,
+      reward      NUMERIC(32,8),
+      reputation  INTEGER,
+      created_at  TIMESTAMP DEFAULT now()
+    );
+  `);
+}
+
+// Helpers de estado de usuário
+async function ensureWalletRow(addr) {
+  if (!addr) return;
+  await query(`
+    INSERT INTO wallets (addr)
+    VALUES ($1)
+    ON CONFLICT (addr) DO NOTHING
+  `, [addr]);
+
+  await query(`
+    INSERT INTO user_state (addr)
+    VALUES ($1)
+    ON CONFLICT (addr) DO NOTHING
+  `, [addr]);
+}
+
+async function addCreditsAndReputation(addr, creditsDelta, repDelta) {
+  await ensureWalletRow(addr);
+  await query(`
+    UPDATE user_state
+    SET
+      credits    = COALESCE(credits, 0) + $2,
+      reputation = COALESCE(reputation, 0) + $3,
+      updated_at = now()
+    WHERE addr = $1
+  `, [addr, creditsDelta, repDelta]);
+}
+
+// --------- MIDDLEWARES ----------
+app.use(cors());
 app.use(express.json());
 
-// (Opcional) servir front estático se quiser:
-// const path = require('path');
-// app.use(express.static(path.join(__dirname, '..')));
+// --------- HEALTH CHECK ----------
+app.get('/api/health', async (req, res) => {
+  const foneConfigured = !!(FONE_BASE_URL && FONE_SDK_KEY);
+  const dbConfigured   = !!process.env.DATABASE_URL;
 
-// ----- HEALTH CHECK -----
-app.get('/api/health', (req, res) => {
-  const configured = !!(FONE_BASE_URL && FONE_SDK_KEY);
+  let dbOk = false;
+  try {
+    if (dbConfigured) {
+      await query('SELECT 1');
+      dbOk = true;
+    }
+  } catch (e) {
+    dbOk = false;
+  }
+
   res.json({
     ok: true,
-    configured,
-    message: configured
-      ? 'Eco-Verify backend is running and Fone config is set'
-      : 'Eco-Verify backend is running, but FONE_BASE_URL / FONE_SDK_KEY are missing'
+    foneConfigured,
+    dbConfigured,
+    dbOk,
+    message: 'Eco-Verify backend is running'
   });
 });
 
-// ============= FONE API PROXY =============
+// ============= FONE API PROXY =================
 
-// Criar carteira
+// Create wallet
 app.post('/api/fone/wallet/create', async (req, res) => {
   try {
     const data = await callFone('/v1/wallet/create', 'POST');
+
+    const addr = data.address;
+    if (addr) {
+      await ensureWalletRow(addr);
+    }
+
     res.json(data);
   } catch (err) {
     console.error('POST /api/fone/wallet/create', err.message);
@@ -87,7 +168,7 @@ app.post('/api/fone/wallet/create', async (req, res) => {
   }
 });
 
-// Importar carteira
+// Import wallet
 app.post('/api/fone/wallet/import', async (req, res) => {
   const { privateKey } = req.body || {};
   if (!privateKey) {
@@ -95,6 +176,12 @@ app.post('/api/fone/wallet/import', async (req, res) => {
   }
   try {
     const data = await callFone('/v1/wallet/import', 'POST', { privateKey });
+
+    const addr = data.address;
+    if (addr) {
+      await ensureWalletRow(addr);
+    }
+
     res.json(data);
   } catch (err) {
     console.error('POST /api/fone/wallet/import', err.message);
@@ -102,7 +189,7 @@ app.post('/api/fone/wallet/import', async (req, res) => {
   }
 });
 
-// Saldo (não está sendo usado no front agora, mas deixei)
+// Balance (não está sendo usado diretamente no front, mas mantido)
 app.get('/api/fone/wallet/:addr/balance', async (req, res) => {
   const addr = req.params.addr;
   try {
@@ -117,7 +204,7 @@ app.get('/api/fone/wallet/:addr/balance', async (req, res) => {
   }
 });
 
-// Transações + dados da carteira
+// Transactions + addressData
 app.get('/api/fone/wallet/:addr/transactions', async (req, res) => {
   const addr = req.params.addr;
   try {
@@ -132,7 +219,7 @@ app.get('/api/fone/wallet/:addr/transactions', async (req, res) => {
   }
 });
 
-// Envio de FONE
+// Send FONE
 app.post('/api/fone/transaction/send', async (req, res) => {
   const { privateKey, recipient, amount, message } = req.body || {};
   if (!privateKey || !recipient || !amount) {
@@ -149,8 +236,77 @@ app.post('/api/fone/transaction/send', async (req, res) => {
   }
 });
 
-// ----- START -----
-const port = process.env.PORT || 4000;
-app.listen(port, () => {
-  console.log('Eco-Verify backend running on port', port);
+// ============= APP STATE (credits, reputation, missions) =============
+
+// Get user state (credits + reputation)
+app.get('/api/app/user/:addr/state', async (req, res) => {
+  const addr = req.params.addr;
+  if (!addr) return res.status(400).json({ error: 'addr required' });
+
+  try {
+    const r = await query(
+      'SELECT credits, reputation FROM user_state WHERE addr = $1',
+      [addr]
+    );
+    if (!r.rows.length) {
+      return res.json({ addr, credits: 0, reputation: 0 });
+    }
+    const row = r.rows[0];
+    res.json({
+      addr,
+      credits: Number(row.credits || 0),
+      reputation: Number(row.reputation || 0)
+    });
+  } catch (err) {
+    console.error('GET /api/app/user/:addr/state', err.message);
+    res.status(500).json({ error: 'DB error (user state)' });
+  }
 });
+
+// Register completed mission and update credits + reputation
+// body: { addr, missionId, reward, reputation, report }
+app.post('/api/app/mission/completed', async (req, res) => {
+  const { addr, missionId, reward, reputation, report } = req.body || {};
+  if (!addr || !missionId) {
+    return res.status(400).json({ error: 'addr and missionId are required' });
+  }
+
+  const rewardNum = Number(reward || 0);
+  const repNum    = Number(reputation || 0);
+
+  try {
+    await ensureWalletRow(addr);
+
+    await query(`
+      INSERT INTO mission_completion (addr, mission_id, report, reward, reputation)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [addr, missionId, report || '', rewardNum, repNum]);
+
+    await addCreditsAndReputation(addr, rewardNum, repNum);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/app/mission/completed', err.message);
+    res.status(500).json({ error: 'DB error (mission complete)' });
+  }
+});
+
+// (Opcional) simples root
+app.get('/', (req, res) => {
+  res.send('Eco-Verify backend is running. Use /api/health for status.');
+});
+
+// --------- STARTUP ----------
+const port = process.env.PORT || 4000;
+
+initDb()
+  .then(() => {
+    console.log('Database initialized.');
+    app.listen(port, () => {
+      console.log('Eco-Verify backend running on port', port);
+    });
+  })
+  .catch((err) => {
+    console.error('Error initializing database:', err);
+    process.exit(1);
+  });
